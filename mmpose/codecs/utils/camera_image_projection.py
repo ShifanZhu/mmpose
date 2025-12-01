@@ -11,13 +11,13 @@ def camera_to_image_coord(root_index: int, kpts_3d_cam: np.ndarray,
     Args:
         root_index (int): Index for root keypoint.
         kpts_3d_cam (np.ndarray): Keypoint coordinates in camera space in
-            shape (N, K, D).
+            shape (N, K, D). D is 3 (XYZ).
         camera_param (dict): Parameters for the camera.
 
     Returns:
         tuple:
         - kpts_3d_image (np.ndarray): Keypoint coordinates in image space in
-            shape (N, K, D).
+            shape (N, K, D). D is 3 (uvd).
         - factor (np.ndarray): The scaling factor that maps keypoints from
             image space to camera space in shape (N, ).
     """
@@ -37,13 +37,12 @@ def camera_to_image_coord(root_index: int, kpts_3d_cam: np.ndarray,
 
     rectangle_3d_size = 2.0
     kpts_3d_image = np.zeros_like(kpts_3d_cam)
-    kpts_3d_image[..., :2] = camera_to_pixel(kpts_3d_cam.copy(), fx, fy, cx,
-                                             cy)
+    kpts_3d_image[..., :2] = camera_to_pixel(kpts_3d_cam.copy(), fx, fy, cx, cy) # save u,v, shape (N,K,2)
     ratio = (br2d[..., 0] - tl2d[..., 0] + 0.001) / rectangle_3d_size
     factor = rectangle_3d_size / (br2d[..., 0] - tl2d[..., 0] + 0.001)
     kpts_3d_depth = ratio[:, None] * (
-        kpts_3d_cam[..., 2] - kpts_3d_cam[..., root_index:root_index + 1, 2])
-    kpts_3d_image[..., 2] = kpts_3d_depth
+        kpts_3d_cam[..., 2] - kpts_3d_cam[..., root_index:root_index + 1, 2]) # save depth, shape (N,K)
+    kpts_3d_image[..., 2] = kpts_3d_depth # save depth to kpts_3d_image, shape (N,K,3)
     return kpts_3d_image, factor
 
 

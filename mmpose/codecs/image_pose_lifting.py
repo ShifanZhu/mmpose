@@ -2,6 +2,7 @@
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
+from onnx_ir import Shape
 
 from mmpose.registry import KEYPOINT_CODECS
 from .base import BaseKeypointCodec
@@ -12,6 +13,10 @@ class ImagePoseLifting(BaseKeypointCodec):
     r"""Generate keypoint coordinates for pose lifter.
 
     Note:
+        !!! The network learns human-body priors, not geometry !!!
+        No physics needed.
+        No camera intrinsics needed.
+        Just statistical learning.
 
         - instance number: N
         - keypoint number: K
@@ -148,20 +153,23 @@ class ImagePoseLifting(BaseKeypointCodec):
         if keypoints_visible is None:
             keypoints_visible = np.ones(keypoints.shape[:2], dtype=np.float32)
 
+        # If there is no 3D target provided, it falls back to using the 2D keypoints of the first instance.
+        # In real lifting setups, lifting_target is usually your GT 3D pose (T, K, C).
         if lifting_target is None:
             lifting_target = [keypoints[0]]
 
         # set initial value for `lifting_target_weight`
         # and `trajectory_weights`
         if lifting_target_visible is None:
-            lifting_target_visible = np.ones(
+            lifting_target_visible = np.ones( # Assume all joints are visible
                 lifting_target.shape[:-1], dtype=np.float32)
-            lifting_target_weight = lifting_target_visible
+            lifting_target_weight = lifting_target_visible # visibility mask
+            # using depth (z) to weight trajectory; closer joints (smaller z) get higher weight.
             trajectory_weights = (1 / lifting_target[:, 2])
         else:
             valid = lifting_target_visible > 0.5
-            lifting_target_weight = np.where(valid, 1., 0.).astype(np.float32)
-            trajectory_weights = lifting_target_weight
+            lifting_target_weight = np.where(valid, 1., 0.).astype(np.float32) # weights for 3D pose loss
+            trajectory_weights = lifting_target_weight # often used in temporal models (how much to trust each joint along time)
 
         encoded = dict()
 
@@ -170,13 +178,21 @@ class ImagePoseLifting(BaseKeypointCodec):
                 lifting_target.shape[-2] > max(self.root_index)), \
             f'Got invalid joint shape {lifting_target.shape}'
 
+        # self.root_index is a list of joint indices defining the root (e.g. pelvis or hip).
+        # It computes the mean 3D position of those root joints → root with shape (…, C).
         root = np.mean(
             lifting_target[..., self.root_index, :], axis=-2, dtype=np.float32)
+        # all poses are now zero-centered around the root.
+        # this removes global position and keeps only relative pose.
+        # This is standard in 3D pose: we want poses relative to pelvis, not in absolute world coordinates.
         lifting_target_label = lifting_target - root[np.newaxis, ...]
 
-        if self.remove_root and len(self.root_index) == 1:
+        # Optionally remove the root joint from the target
+        if self.remove_root and len(self.root_index) == 1: # only support single root joint removal
+            # It removes the root joint from: lifting_target_label (3D poses)
+            # lifting_target_visible, lifting_target_weight
             root_index = self.root_index[0]
-            lifting_target_label = np.delete(
+            lifting_target_label = np.delete( # (3D poses)
                 lifting_target_label, root_index, axis=-2)
             lifting_target_visible = np.delete(
                 lifting_target_visible, root_index, axis=-2)
@@ -206,6 +222,7 @@ class ImagePoseLifting(BaseKeypointCodec):
             encoded['keypoints_mean'] = self.keypoints_mean.copy()
             encoded['keypoints_std'] = self.keypoints_std.copy()
 
+            # Normalize 2D keypoints:
             keypoint_labels = (keypoint_labels -
                                self.keypoints_mean) / self.keypoints_std
         if self.target_mean is not None:
@@ -213,6 +230,7 @@ class ImagePoseLifting(BaseKeypointCodec):
                 f'self.target_mean.shape {self.target_mean.shape} '
                 f'!= lifting_target_label.shape {lifting_target_label.shape}'  # noqa
             )
+            # Save the mean/std in encoded to allow denormalization later.
             encoded['target_mean'] = self.target_mean.copy()
             encoded['target_std'] = self.target_std.copy()
 
@@ -220,12 +238,18 @@ class ImagePoseLifting(BaseKeypointCodec):
                                     self.target_mean) / self.target_std
 
         # Generate reshaped keypoint coordinates
+        # Reshape keypoints / optionally append visibility
+        # Ensure keypoint_labels has shape (N, K, D). If it was (K, D), add batch dimension N=1.
         assert keypoint_labels.ndim in {
             2, 3
         }, (f'keypoint_labels.ndim {keypoint_labels.ndim} is not in {2, 3}')
         if keypoint_labels.ndim == 2:
             keypoint_labels = keypoint_labels[None, ...]
 
+        # Optionally concatenate visibility into last dim
+        # If concat_vis == True: Attach visibility as an extra channel, 
+        # so each joint vector is [x, y, vis] instead of just [x, y].
+        # Shape becomes (N, K, D+1).
         if self.concat_vis:
             keypoints_visible_ = keypoints_visible
             if keypoints_visible.ndim == 2:
@@ -233,10 +257,14 @@ class ImagePoseLifting(BaseKeypointCodec):
             keypoint_labels = np.concatenate(
                 (keypoint_labels, keypoints_visible_), axis=2)
 
+        # Optionally reshape keypoints: transpose from (N,K,D) to (K,D,N), then reshape to (K*D, N)
+        # This is often convenient for certain model inputs 
+        # (e.g. treat all joints×dims as a single feature vector per frame).
         if self.reshape_keypoints:
             N = keypoint_labels.shape[0]
             keypoint_labels = keypoint_labels.transpose(1, 2, 0).reshape(-1, N)
 
+        # Fill the encoded dict
         encoded['keypoint_labels'] = keypoint_labels
         encoded['keypoint_labels_visible'] = keypoints_visible
         encoded['lifting_target_label'] = lifting_target_label
@@ -244,6 +272,18 @@ class ImagePoseLifting(BaseKeypointCodec):
         encoded['trajectory_weights'] = trajectory_weights
         encoded['target_root'] = root
 
+        # So final outputs:
+        # keypoint_labels: processed 2D keypoints (maybe normalized, maybe flattened, maybe with vis appended)
+        # keypoint_labels_visible: 2D visibility mask
+        # lifting_target_label: root-centered + normalized 3D target pose
+        # lifting_target_weight: weights for 3D loss
+        # trajectory_weights: weights for trajectory modeling
+        # target_root: the original root joint 3D coordinate (before zero-centering)
+
+        # Plus optional flags/meta:
+        # target_root_removed: if root joint was dropped
+        # target_root_index: which index was used as root
+        # keypoints_mean/std, target_mean/std: for inverse transform
         return encoded
 
     def decode(self,
